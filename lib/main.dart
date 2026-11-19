@@ -16,7 +16,7 @@ class DocumentMergerApp extends StatelessWidget {
       title: 'Document Merger',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        colorSchemeSeed: Colors.blue,
         useMaterial3: true,
       ),
       home: const HomePage(),
@@ -32,15 +32,51 @@ class DocumentRow {
   String material;
   String source;
   String page;
+  String originalText;
+  bool needsReview;
 
   DocumentRow({
-    this.product = '',
-    this.dimensions = '',
-    this.quantity = '1',
-    this.thickness = '',
-    this.material = '',
-    this.source = '',
-    this.page = '',
+    required this.product,
+    required this.dimensions,
+    required this.quantity,
+    required this.thickness,
+    required this.material,
+    required this.source,
+    required this.page,
+    required this.originalText,
+    this.needsReview = false,
+  });
+
+  DocumentRow copy() {
+    return DocumentRow(
+      product: product,
+      dimensions: dimensions,
+      quantity: quantity,
+      thickness: thickness,
+      material: material,
+      source: source,
+      page: page,
+      originalText: originalText,
+      needsReview: needsReview,
+    );
+  }
+}
+
+class ParsedRow {
+  final String product;
+  final String dimensions;
+  final String quantity;
+  final String thickness;
+  final String material;
+  final bool needsReview;
+
+  ParsedRow({
+    required this.product,
+    required this.dimensions,
+    required this.quantity,
+    required this.thickness,
+    required this.material,
+    required this.needsReview,
   });
 }
 
@@ -54,74 +90,61 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final List<PlatformFile> documents = [];
   final List<DocumentRow> rows = [];
-
-  bool isLoading = false;
+  bool isImporting = false;
 
   Future<void> addDocuments() async {
-    setState(() => isLoading = true);
+    final pickedFiles = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf', 'xls', 'xlsx'],
+    );
 
-    try {
-      final pickedFiles = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['pdf', 'xls', 'xlsx'],
-      );
+    if (pickedFiles == null || pickedFiles.isEmpty) return;
 
-      if (pickedFiles.isEmpty) return;
+    setState(() {
+      isImporting = true;
+      documents.addAll(pickedFiles);
+    });
 
-      int imported = 0;
-      int failed = 0;
+    int imported = 0;
 
-      for (final file in pickedFiles) {
-        documents.add(file);
+    for (final file in pickedFiles) {
+      final extension = file.extension?.toLowerCase();
 
-        final extension = file.extension?.toLowerCase();
+      if (extension == 'xlsx' || extension == 'xls') {
+        try {
+          final bytes = await file.readAsBytes();
+          final workbook = Excel.decodeBytes(bytes);
 
-        if (extension == 'xls' || extension == 'xlsx') {
-          try {
-            final bytes = await file.readAsBytes();
-            final workbook = Excel.decodeBytes(bytes);
-
-            for (final sheetName in workbook.tables.keys) {
-              final sheet = workbook[sheetName];
-
-              if (sheet == null) continue;
-
+          for (final sheetName in workbook.tables.keys) {
+            final sheet = workbook[sheetName];
+            if (sheet != null) {
               imported += importSheet(
                 sheet.rows,
                 file.name,
                 sheetName,
               );
             }
-          } catch (e) {
-            failed++;
           }
+        } catch (e) {
+          debugPrint('Ошибка чтения ${file.name}: $e');
         }
       }
-
-      if (!mounted) return;
-
-      setState(() {});
-
-      String message = 'Добавлено позиций: $imported';
-
-      if (failed > 0) {
-        message += '. Не удалось прочитать файлов: $failed';
-      }
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(message)),
-      );
-    } catch (e) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Ошибка выбора файлов: $e')),
-      );
-    } finally {
-      if (mounted) {
-        setState(() => isLoading = false);
-      }
     }
+
+    if (!mounted) return;
+
+    setState(() {
+      isImporting = false;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Добавлено документов: ${pickedFiles.length}. '
+          'Распознано строк Excel: $imported',
+        ),
+      ),
+    );
   }
 
   int importSheet(
@@ -129,143 +152,39 @@ class _HomePageState extends State<HomePage> {
     String fileName,
     String sheetName,
   ) {
-    if (sheetRows.isEmpty) return 0;
-
     int imported = 0;
-    int? headerIndex;
-    final Map<String, int> columns = {};
 
-    final aliases = {
-      'product': [
-        'изделие',
-        'наименование',
-        'название',
-        'позиция',
-        'деталь',
-        'товар',
-        'product',
-        'name',
-        'item',
-      ],
-      'dimensions': [
-        'размер',
-        'габарит',
-        'сечение',
-        'dimensions',
-        'size',
-      ],
-      'quantity': [
-        'количество',
-        'кол-во',
-        'колво',
-        'qty',
-        'quantity',
-        'count',
-        'штук',
-      ],
-      'thickness': [
-        'толщина',
-        'толщ',
-        'thickness',
-        'gauge',
-      ],
-      'material': [
-        'материал',
-        'марка стали',
-        'material',
-        'steel',
-      ],
-    };
-
-    String normalize(String value) {
-      return value
-          .toLowerCase()
-          .replaceAll('ё', 'е')
-          .replaceAll(RegExp(r'[^a-zа-я0-9]'), '');
-    }
-
-    // Ищем строку с заголовками в первых 15 строках.
-    int bestScore = 0;
-
-    for (int r = 0; r < sheetRows.length && r < 15; r++) {
-      final values = sheetRows[r]
-          .map((cell) => cell?.value?.toString() ?? '')
-          .toList();
-
-      final found = <String, int>{};
-
-      for (int c = 0; c < values.length; c++) {
-        final value = normalize(values[c]);
-
-        for (final field in aliases.keys) {
-          if (found.containsKey(field)) continue;
-
-          final matches = aliases[field]!.any(
-            (alias) => value.contains(normalize(alias)),
-          );
-
-          if (matches) {
-            found[field] = c;
-          }
-        }
-      }
-
-      if (found.length > bestScore) {
-        bestScore = found.length;
-        headerIndex = r;
-        columns
-          ..clear()
-          ..addAll(found);
-      }
-    }
-
-    // Если заголовки не найдены, сохраняем содержимое строк
-    // для последующей проверки пользователем.
-    final startRow = headerIndex == null ? 0 : headerIndex + 1;
-
-    for (int r = startRow; r < sheetRows.length; r++) {
-      final values = sheetRows[r]
+    for (final row in sheetRows) {
+      final cells = row
           .map((cell) => cell?.value?.toString().trim() ?? '')
+          .where((value) => value.isNotEmpty)
           .toList();
 
-      if (values.every((value) => value.isEmpty)) {
+      if (cells.isEmpty) continue;
+
+      final text = cells.join(' | ').trim();
+
+      if (text.isEmpty || _looksLikeHeader(text)) continue;
+
+      final parsed = parseRow(text);
+
+      if (parsed.product.isEmpty &&
+          parsed.dimensions.isEmpty &&
+          parsed.quantity.isEmpty) {
         continue;
       }
 
-      String getValue(String field) {
-        final index = columns[field];
-
-        if (index == null || index >= values.length) {
-          return '';
-        }
-
-        return values[index];
-      }
-
-      String product = getValue('product');
-
-      // Если название не определено, сохраняем всю строку
-      // в поле изделия, чтобы не потерять исходные данные.
-      if (product.isEmpty) {
-        product = values
-            .where((value) => value.isNotEmpty)
-            .join(' | ');
-      }
-
-      final dimensions = getValue('dimensions');
-      final quantity = getValue('quantity');
-      final thickness = getValue('thickness');
-      final material = getValue('material');
-
       rows.add(
         DocumentRow(
-          product: product,
-          dimensions: dimensions,
-          quantity: quantity.isEmpty ? '1' : quantity,
-          thickness: thickness,
-          material: material,
+          product: parsed.product,
+          dimensions: parsed.dimensions,
+          quantity: parsed.quantity,
+          thickness: parsed.thickness,
+          material: parsed.material,
           source: fileName,
           page: sheetName,
+          originalText: text,
+          needsReview: parsed.needsReview,
         ),
       );
 
@@ -275,82 +194,322 @@ class _HomePageState extends State<HomePage> {
     return imported;
   }
 
-  void removeDocument(int index) {
-    setState(() => documents.removeAt(index));
+  bool _looksLikeHeader(String text) {
+    final value = text.toLowerCase();
+    final words = [
+      'наименование',
+      'название',
+      'изделие',
+      'размер',
+      'количество',
+      'кол-во',
+      'толщина',
+      'материал',
+    ];
+
+    int matches = 0;
+    for (final word in words) {
+      if (value.contains(word)) matches++;
+    }
+
+    return matches >= 2;
   }
 
-  void addRow() {
-    setState(() {
-      rows.add(DocumentRow());
-    });
+  ParsedRow parseRow(String original) {
+    final text = original.replaceAll('\n', ' ').trim();
+    String working = text;
+
+    String dimensions = '';
+    String thickness = '';
+    String material = '';
+    String quantity = '';
+
+    bool needsReview = false;
+
+    // Размеры: 500x300, 500х300, 500×300, Ø250.
+    final dimensionRegex = RegExp(
+      r'(?:Ø|⌀)\s*\d{2,4}(?:[.,]\d+)?'
+      r'|\d{2,4}\s*[xх×*]\s*\d{2,4}'
+      r'(?:\s*[xх×*]\s*\d{2,4})?',
+      caseSensitive: false,
+    );
+
+    final dimensionMatches = dimensionRegex
+        .allMatches(working)
+        .map((match) => match.group(0)!.replaceAll(' ', ''))
+        .toSet()
+        .toList();
+
+    if (dimensionMatches.isNotEmpty) {
+      dimensions = dimensionMatches.join('; ');
+      working = working.replaceAll(dimensionRegex, ' ');
+    }
+
+    // Толщина.
+    final markedThickness = RegExp(
+      r'(?:толщ(?:ина)?|(?<![а-яa-z])s|(?<![а-яa-z])t|δ)'
+      r'\s*[:=]?\s*(\d{1,2}[.,]\d{1,3})',
+      caseSensitive: false,
+    );
+
+    final markedMatch = markedThickness.firstMatch(working);
+
+    if (markedMatch != null) {
+      thickness = markedMatch.group(1)!.replaceAll(',', '.');
+      working = working.replaceFirst(markedThickness, ' ');
+    } else {
+      final decimalRegex = RegExp(
+        r'(?<!\d)(\d{1,2}[.,]\d{1,3})(?!\d)',
+      );
+
+      for (final match in decimalRegex.allMatches(working).toList()) {
+        final number = double.tryParse(
+          match.group(1)!.replaceAll(',', '.'),
+        );
+
+        if (number != null && number >= 0.3 && number <= 3.0) {
+          thickness = number.toStringAsFixed(2);
+          working = working.replaceRange(
+            match.start,
+            match.end,
+            ' ',
+          );
+          break;
+        }
+      }
+    }
+
+    // Материал.
+    final materialPatterns = [
+      RegExp(r'нержав(?:еющая)?\s*сталь', caseSensitive: false),
+      RegExp(r'нерж\.?', caseSensitive: false),
+      RegExp(r'оцинк(?:ованная|ованной|ованный)?', caseSensitive: false),
+      RegExp(r'ст\.?\s*оц\.?', caseSensitive: false),
+      RegExp(r'черная\s*сталь', caseSensitive: false),
+      RegExp(r'алюмини(?:й|евая|евый)', caseSensitive: false),
+      RegExp(r'\baisi\s*\d{3,4}\b', caseSensitive: false),
+      RegExp(r'\bdx51\b', caseSensitive: false),
+    ];
+
+    for (final pattern in materialPatterns) {
+      final match = pattern.firstMatch(working);
+      if (match != null) {
+        material = match.group(0)!.trim();
+        working = working.replaceFirst(pattern, ' ');
+        break;
+      }
+    }
+
+    // Количество.
+    final quantityPatterns = [
+      RegExp(
+        r'(?:кол-?во|количество|qty)\s*[:=]?\s*(\d+)',
+        caseSensitive: false,
+      ),
+      RegExp(
+        r'(\d+)\s*(?:шт\.?|штук|pcs?)\b',
+        caseSensitive: false,
+      ),
+    ];
+
+    for (final pattern in quantityPatterns) {
+      final match = pattern.firstMatch(working);
+      if (match != null) {
+        quantity = match.group(1)!;
+        working = working.replaceFirst(pattern, ' ');
+        break;
+      }
+    }
+
+    String product = working
+        .replaceAll('|', ' ')
+        .replaceAll(RegExp(r'[,;]+'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    product = product.replaceAll(
+      RegExp(
+        r'^(?:наименование|изделие|название)\s*[:=]?\s*',
+        caseSensitive: false,
+      ),
+      '',
+    );
+
+    if (product.isEmpty ||
+        dimensions.isEmpty ||
+        quantity.isEmpty ||
+        thickness.isEmpty ||
+        material.isEmpty) {
+      needsReview = true;
+    }
+
+    if (product.isEmpty) {
+      product = text;
+      needsReview = true;
+    }
+
+    return ParsedRow(
+      product: product,
+      dimensions: dimensions,
+      quantity: quantity,
+      thickness: thickness,
+      material: material,
+      needsReview: needsReview,
+    );
   }
 
-  void removeRow(int index) {
-    setState(() => rows.removeAt(index));
+  void openTable() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => TablePage(
+          rows: rows,
+          onChanged: () => setState(() {}),
+        ),
+      ),
+    );
   }
 
-  void editRow(int index) {
-    final row = rows[index];
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Обработка документов'),
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              FilledButton.icon(
+                onPressed: isImporting ? null : addDocuments,
+                icon: const Icon(Icons.add),
+                label: const Text('Добавить документы'),
+              ),
+              const SizedBox(height: 10),
+              FilledButton.tonalIcon(
+                onPressed: openTable,
+                icon: const Icon(Icons.table_chart),
+                label: Text('Открыть общую таблицу (${rows.length})'),
+              ),
+              const SizedBox(height: 16),
+              if (isImporting) const LinearProgressIndicator(),
+              const SizedBox(height: 8),
+              Text(
+                'Добавленные документы: ${documents.length}',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              Expanded(
+                child: documents.isEmpty
+                    ? const Center(
+                        child: Text('Документы пока не добавлены'),
+                      )
+                    : ListView.builder(
+                        itemCount: documents.length,
+                        itemBuilder: (context, index) {
+                          final file = documents[index];
+                          return Card(
+                            child: ListTile(
+                              leading: const Icon(Icons.insert_drive_file),
+                              title: Text(file.name),
+                              subtitle: Text(
+                                file.extension?.toUpperCase() ?? 'Файл',
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+              const Text(
+                'PDF пока добавляется в список, '
+                'но распознавание содержимого PDF ещё не подключено.',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
 
-    final productController = TextEditingController(text: row.product);
-    final dimensionsController =
-        TextEditingController(text: row.dimensions);
-    final quantityController = TextEditingController(text: row.quantity);
-    final thicknessController = TextEditingController(text: row.thickness);
-    final materialController = TextEditingController(text: row.material);
-    final sourceController = TextEditingController(text: row.source);
-    final pageController = TextEditingController(text: row.page);
+class TablePage extends StatefulWidget {
+  final List<DocumentRow> rows;
+  final VoidCallback onChanged;
 
-    showDialog(
+  const TablePage({
+    super.key,
+    required this.rows,
+    required this.onChanged,
+  });
+
+  @override
+  State<TablePage> createState() => _TablePageState();
+}
+
+class _TablePageState extends State<TablePage> {
+  List<DocumentRow>? previousRows;
+
+  Future<void> editRow(DocumentRow row) async {
+    final product = TextEditingController(text: row.product);
+    final dimensions = TextEditingController(text: row.dimensions);
+    final quantity = TextEditingController(text: row.quantity);
+    final thickness = TextEditingController(text: row.thickness);
+    final material = TextEditingController(text: row.material);
+
+    final result = await showDialog<bool>(
       context: context,
-      builder: (dialogContext) {
+      builder: (context) {
         return AlertDialog(
-          title: Text('Редактирование позиции ${index + 1}'),
+          title: const Text('Редактирование позиции'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                buildField('Изделие', productController),
-                buildField('Размеры', dimensionsController),
-                buildField('Количество', quantityController),
-                buildField('Толщина', thicknessController),
-                buildField('Материал', materialController),
-                buildField('Исходный файл', sourceController),
-                buildField('Лист / страница', pageController),
+                _editField(product, 'Название изделия'),
+                _editField(dimensions, 'Размеры'),
+                _editField(quantity, 'Количество'),
+                _editField(thickness, 'Толщина'),
+                _editField(material, 'Материал'),
               ],
             ),
           ),
           actions: [
             TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
+              onPressed: () => Navigator.pop(context, false),
               child: const Text('Отмена'),
             ),
             FilledButton(
-              onPressed: () {
-                setState(() {
-                  row.product = productController.text;
-                  row.dimensions = dimensionsController.text;
-                  row.quantity = quantityController.text;
-                  row.thickness = thicknessController.text;
-                  row.material = materialController.text;
-                  row.source = sourceController.text;
-                  row.page = pageController.text;
-                });
-
-                Navigator.pop(dialogContext);
-              },
+              onPressed: () => Navigator.pop(context, true),
               child: const Text('Сохранить'),
             ),
           ],
         );
       },
     );
+
+    if (result == true) {
+      setState(() {
+        row.product = product.text;
+        row.dimensions = dimensions.text;
+        row.quantity = quantity.text;
+        row.thickness = thickness.text;
+        row.material = material.text;
+        row.needsReview = false;
+      });
+      widget.onChanged();
+    }
+
+    product.dispose();
+    dimensions.dispose();
+    quantity.dispose();
+    thickness.dispose();
+    material.dispose();
   }
 
-  Widget buildField(
-    String label,
-    TextEditingController controller,
-  ) {
+  Widget _editField(TextEditingController controller, String label) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: TextField(
@@ -363,200 +522,167 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Document Merger'),
-        centerTitle: true,
-      ),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            children: [
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton.icon(
-                  onPressed: isLoading ? null : addDocuments,
-                  icon: const Icon(Icons.add),
-                  label: const Text('Добавить документы'),
-                ),
-              ),
-              const SizedBox(height: 10),
-              SizedBox(
-                width: double.infinity,
-                child: FilledButton(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => TablePage(
-                          rows: rows,
-                          onAddRow: addRow,
-                          onEditRow: editRow,
-                          onRemoveRow: removeRow,
-                        ),
-                      ),
-                    );
-                  },
-                  child: const Text('Открыть общую таблицу'),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                'Выбрано файлов: ${documents.length}',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              Text('Позиций в таблице: ${rows.length}'),
-              const SizedBox(height: 10),
-              Expanded(
-                child: documents.isEmpty
-                    ? const Center(
-                        child: Text('Документы пока не добавлены'),
-                      )
-                    : ListView.builder(
-                        itemCount: documents.length,
-                        itemBuilder: (context, index) {
-                          final document = documents[index];
-                          final isPdf = document.name
-                              .toLowerCase()
-                              .endsWith('.pdf');
+  void deleteRow(int index) {
+    setState(() {
+      widget.rows.removeAt(index);
+    });
+    widget.onChanged();
+  }
 
-                          return Card(
-                            child: ListTile(
-                              leading: Icon(
-                                isPdf
-                                    ? Icons.picture_as_pdf
-                                    : Icons.table_chart,
-                              ),
-                              title: Text(
-                                document.name,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              subtitle: Text(
-                                document.extension?.toUpperCase() ??
-                                    'Документ',
-                              ),
-                              trailing: IconButton(
-                                icon: const Icon(Icons.delete_outline),
-                                onPressed: () => removeDocument(index),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-              ),
-              if (isLoading)
-                const Padding(
-                  padding: EdgeInsets.all(8),
-                  child: CircularProgressIndicator(),
-                ),
-            ],
-          ),
-        ),
-      ),
+  void mergeDuplicates() {
+    previousRows = widget.rows.map((row) => row.copy()).toList();
+
+    final Map<String, List<DocumentRow>> groups = {};
+
+    for (final row in widget.rows) {
+      final key = [
+        row.product.toLowerCase().trim(),
+        row.dimensions.toLowerCase().trim(),
+        row.thickness.toLowerCase().trim(),
+        row.material.toLowerCase().trim(),
+      ].join('|');
+
+      groups.putIfAbsent(key, () => []).add(row);
+    }
+
+    final List<DocumentRow> merged = [];
+
+    for (final group in groups.values) {
+      if (group.length == 1) {
+        merged.add(group.first);
+        continue;
+      }
+
+      final quantities = group
+          .map((row) => int.tryParse(row.quantity))
+          .toList();
+
+      if (quantities.any((value) => value == null)) {
+        merged.addAll(group);
+        continue;
+      }
+
+      final first = group.first.copy();
+      final total = quantities.fold<int>(
+        0,
+        (sum, value) => sum + value!,
+      );
+
+      first.quantity = total.toString();
+      first.source = group.map((r) => r.source).toSet().join('; ');
+      first.page = group.map((r) => r.page).toSet().join('; ');
+      first.needsReview = group.any((r) => r.needsReview);
+
+      merged.add(first);
+    }
+
+    setState(() {
+      widget.rows
+        ..clear()
+        ..addAll(merged);
+    });
+
+    widget.onChanged();
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Объединение выполнено')),
     );
   }
-}
 
-class TablePage extends StatefulWidget {
-  final List<DocumentRow> rows;
-  final VoidCallback onAddRow;
-  final Function(int) onEditRow;
-  final Function(int) onRemoveRow;
+  void undoMerge() {
+    if (previousRows == null) return;
 
-  const TablePage({
-    super.key,
-    required this.rows,
-    required this.onAddRow,
-    required this.onEditRow,
-    required this.onRemoveRow,
-  });
+    setState(() {
+      widget.rows
+        ..clear()
+        ..addAll(previousRows!.map((row) => row.copy()));
+      previousRows = null;
+    });
 
-  @override
-  State<TablePage> createState() => _TablePageState();
-}
+    widget.onChanged();
+  }
 
-class _TablePageState extends State<TablePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Общая таблица'),
+        title: Text('Общая таблица (${widget.rows.length})'),
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () {
-          widget.onAddRow();
-          setState(() {});
-        },
-        icon: const Icon(Icons.add),
-        label: const Text('Добавить строку'),
-      ),
-      body: widget.rows.isEmpty
-          ? const Center(
-              child: Text(
-                'Таблица пока пустая.\n'
-                'Добавьте Excel-файл или нажмите «Добавить строку».',
-                textAlign: TextAlign.center,
-              ),
-            )
-          : ListView.builder(
-              padding: const EdgeInsets.only(
-                left: 12,
-                right: 12,
-                top: 12,
-                bottom: 90,
-              ),
-              itemCount: widget.rows.length,
-              itemBuilder: (context, index) {
-                final row = widget.rows[index];
-
-                return Card(
-                  child: ListTile(
-                    leading: CircleAvatar(
-                      child: Text('${index + 1}'),
-                    ),
-                    title: Text(
-                      row.product.isEmpty
-                          ? 'Новая позиция'
-                          : row.product,
-                    ),
-                    subtitle: Text(
-                      'Размеры: ${row.dimensions.isEmpty ? "—" : row.dimensions}\n'
-                      'Количество: ${row.quantity}\n'
-                      'Толщина: ${row.thickness.isEmpty ? "—" : row.thickness}\n'
-                      'Материал: ${row.material.isEmpty ? "—" : row.material}\n'
-                      'Источник: ${row.source.isEmpty ? "—" : row.source}\n'
-                      'Лист / страница: ${row.page.isEmpty ? "—" : row.page}',
-                    ),
-                    isThreeLine: true,
-                    trailing: PopupMenuButton<String>(
-                      onSelected: (value) {
-                        if (value == 'edit') {
-                          widget.onEditRow(index);
-                          setState(() {});
-                        } else if (value == 'delete') {
-                          widget.onRemoveRow(index);
-                          setState(() {});
-                        }
-                      },
-                      itemBuilder: (context) => [
-                        const PopupMenuItem(
-                          value: 'edit',
-                          child: Text('Редактировать'),
-                        ),
-                        const PopupMenuItem(
-                          value: 'delete',
-                          child: Text('Удалить'),
-                        ),
-                      ],
-                    ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Wrap(
+                spacing: 8,
+                children: [
+                  FilledButton.tonal(
+                    onPressed: mergeDuplicates,
+                    child: const Text('Объединить одинаковые'),
                   ),
-                );
-              },
+                  OutlinedButton(
+                    onPressed: previousRows == null ? null : undoMerge,
+                    child: const Text('Отменить объединение'),
+                  ),
+                ],
+              ),
             ),
+            Expanded(
+              child: widget.rows.isEmpty
+                  ? const Center(child: Text('Таблица пока пустая'))
+                  : ListView.builder(
+                      itemCount: widget.rows.length,
+                      itemBuilder: (context, index) {
+                        final row = widget.rows[index];
+
+                        return Card(
+                          margin: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          child: ListTile(
+                            leading: Icon(
+                              row.needsReview
+                                  ? Icons.warning_amber
+                                  : Icons.check_circle_outline,
+                              color: row.needsReview
+                                  ? Colors.orange
+                                  : Colors.green,
+                            ),
+                            title: Text(row.product),
+                            subtitle: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('Размеры: ${row.dimensions}'),
+                                Text('Количество: ${row.quantity}'),
+                                Text('Толщина: ${row.thickness}'),
+                                Text('Материал: ${row.material}'),
+                                Text('Источник: ${row.source}'),
+                                Text('Лист: ${row.page}'),
+                                if (row.needsReview)
+                                  const Text(
+                                    'Проверить',
+                                    style: TextStyle(
+                                      color: Colors.orange,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            isThreeLine: true,
+                            onTap: () => editRow(row),
+                            trailing: IconButton(
+                              icon: const Icon(Icons.delete_outline),
+                              onPressed: () => deleteRow(index),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
