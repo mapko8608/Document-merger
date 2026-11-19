@@ -90,6 +90,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final List<PlatformFile> documents = [];
   final List<DocumentRow> rows = [];
+
   bool isImporting = false;
 
   Future<void> addDocuments() async {
@@ -117,6 +118,7 @@ class _HomePageState extends State<HomePage> {
 
           for (final sheetName in workbook.tables.keys) {
             final sheet = workbook[sheetName];
+
             if (sheet != null) {
               imported += importSheet(
                 sheet.rows,
@@ -164,9 +166,9 @@ class _HomePageState extends State<HomePage> {
 
       final text = cells.join(' | ').trim();
 
-      if (text.isEmpty || _looksLikeHeader(text)) continue;
+      if (text.isEmpty || looksLikeHeader(text)) continue;
 
-      final parsed = parseRow(text);
+      final parsed = parseRow(text, cells);
 
       if (parsed.product.isEmpty &&
           parsed.dimensions.isEmpty &&
@@ -194,8 +196,9 @@ class _HomePageState extends State<HomePage> {
     return imported;
   }
 
-  bool _looksLikeHeader(String text) {
+  bool looksLikeHeader(String text) {
     final value = text.toLowerCase();
+
     final words = [
       'наименование',
       'название',
@@ -208,6 +211,7 @@ class _HomePageState extends State<HomePage> {
     ];
 
     int matches = 0;
+
     for (final word in words) {
       if (value.contains(word)) matches++;
     }
@@ -215,7 +219,7 @@ class _HomePageState extends State<HomePage> {
     return matches >= 2;
   }
 
-  ParsedRow parseRow(String original) {
+  ParsedRow parseRow(String original, List<String> cells) {
     final text = original.replaceAll('\n', ' ').trim();
     String working = text;
 
@@ -226,9 +230,11 @@ class _HomePageState extends State<HomePage> {
 
     bool needsReview = false;
 
-    // Размеры: 500x300, 500х300, 500×300, Ø250.
+    // Диаметры и размеры.
+    // Примеры: Ø250, ⌀250, D250, Ду250, 500x300.
     final dimensionRegex = RegExp(
       r'(?:Ø|⌀)\s*\d{2,4}(?:[.,]\d+)?'
+      r'|\b(?:ду|d)\s*[-=]?\s*\d{2,4}\b'
       r'|\d{2,4}\s*[xх×*]\s*\d{2,4}'
       r'(?:\s*[xх×*]\s*\d{2,4})?',
       caseSensitive: false,
@@ -245,7 +251,7 @@ class _HomePageState extends State<HomePage> {
       working = working.replaceAll(dimensionRegex, ' ');
     }
 
-    // Толщина.
+    // Толщина с явным обозначением.
     final markedThickness = RegExp(
       r'(?:толщ(?:ина)?|(?<![а-яa-z])s|(?<![а-яa-z])t|δ)'
       r'\s*[:=]?\s*(\d{1,2}[.,]\d{1,3})',
@@ -258,24 +264,40 @@ class _HomePageState extends State<HomePage> {
       thickness = markedMatch.group(1)!.replaceAll(',', '.');
       working = working.replaceFirst(markedThickness, ' ');
     } else {
+      // Без обозначения принимаем только вероятную толщину.
       final decimalRegex = RegExp(
         r'(?<!\d)(\d{1,2}[.,]\d{1,3})(?!\d)',
       );
 
-      for (final match in decimalRegex.allMatches(working).toList()) {
+      final decimalMatches = decimalRegex.allMatches(working).toList();
+
+      final possibleThicknesses = <RegExpMatch>[];
+
+      for (final match in decimalMatches) {
         final number = double.tryParse(
           match.group(1)!.replaceAll(',', '.'),
         );
 
         if (number != null && number >= 0.3 && number <= 3.0) {
-          thickness = number.toStringAsFixed(2);
-          working = working.replaceRange(
-            match.start,
-            match.end,
-            ' ',
-          );
-          break;
+          possibleThicknesses.add(match);
         }
+      }
+
+      if (possibleThicknesses.length == 1) {
+        final match = possibleThicknesses.first;
+        final number = double.parse(
+          match.group(1)!.replaceAll(',', '.'),
+        );
+
+        thickness = number.toStringAsFixed(2);
+
+        working = working.replaceRange(
+          match.start,
+          match.end,
+          ' ',
+        );
+      } else if (possibleThicknesses.length > 1) {
+        needsReview = true;
       }
     }
 
@@ -293,6 +315,7 @@ class _HomePageState extends State<HomePage> {
 
     for (final pattern in materialPatterns) {
       final match = pattern.firstMatch(working);
+
       if (match != null) {
         material = match.group(0)!.trim();
         working = working.replaceFirst(pattern, ' ');
@@ -300,7 +323,7 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // Количество.
+    // Количество по явным обозначениям.
     final quantityPatterns = [
       RegExp(
         r'(?:кол-?во|количество|qty)\s*[:=]?\s*(\d+)',
@@ -314,6 +337,7 @@ class _HomePageState extends State<HomePage> {
 
     for (final pattern in quantityPatterns) {
       final match = pattern.firstMatch(working);
+
       if (match != null) {
         quantity = match.group(1)!;
         working = working.replaceFirst(pattern, ' ');
@@ -321,6 +345,35 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
+    // Если количество записано отдельной ячейкой
+    // без слов "шт." или "количество".
+    if (quantity.isEmpty) {
+      final numericCells = <String>[];
+
+      for (final cell in cells) {
+        final value = cell.trim();
+
+        if (RegExp(r'^\d{1,5}$').hasMatch(value)) {
+          numericCells.add(value);
+        }
+      }
+
+      if (numericCells.length == 1) {
+        quantity = numericCells.first;
+
+        // Удаляем найденное количество из текста,
+        // чтобы оно не попало в название изделия.
+        final escaped = RegExp.escape(quantity);
+        working = working.replaceFirst(
+          RegExp(r'(?<!\d)' + escaped + r'(?!\d)'),
+          ' ',
+        );
+      } else if (numericCells.length > 1) {
+        needsReview = true;
+      }
+    }
+
+    // Очищаем название.
     String product = working
         .replaceAll('|', ' ')
         .replaceAll(RegExp(r'[,;]+'), ' ')
@@ -335,6 +388,7 @@ class _HomePageState extends State<HomePage> {
       '',
     );
 
+    // Не угадываем отсутствующие параметры.
     if (product.isEmpty ||
         dimensions.isEmpty ||
         quantity.isEmpty ||
@@ -364,6 +418,7 @@ class _HomePageState extends State<HomePage> {
       MaterialPageRoute(
         builder: (_) => TablePage(
           rows: rows,
+          initialCount: rows.length,
           onChanged: () => setState(() {}),
         ),
       ),
@@ -410,6 +465,7 @@ class _HomePageState extends State<HomePage> {
                         itemCount: documents.length,
                         itemBuilder: (context, index) {
                           final file = documents[index];
+
                           return Card(
                             child: ListTile(
                               leading: const Icon(Icons.insert_drive_file),
@@ -437,11 +493,13 @@ class _HomePageState extends State<HomePage> {
 
 class TablePage extends StatefulWidget {
   final List<DocumentRow> rows;
+  final int initialCount;
   final VoidCallback onChanged;
 
   const TablePage({
     super.key,
     required this.rows,
+    required this.initialCount,
     required this.onChanged,
   });
 
@@ -468,11 +526,11 @@ class _TablePageState extends State<TablePage> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                _editField(product, 'Название изделия'),
-                _editField(dimensions, 'Размеры'),
-                _editField(quantity, 'Количество'),
-                _editField(thickness, 'Толщина'),
-                _editField(material, 'Материал'),
+                editField(product, 'Название изделия'),
+                editField(dimensions, 'Размеры'),
+                editField(quantity, 'Количество'),
+                editField(thickness, 'Толщина'),
+                editField(material, 'Материал'),
               ],
             ),
           ),
@@ -499,6 +557,7 @@ class _TablePageState extends State<TablePage> {
         row.material = material.text;
         row.needsReview = false;
       });
+
       widget.onChanged();
     }
 
@@ -509,7 +568,7 @@ class _TablePageState extends State<TablePage> {
     material.dispose();
   }
 
-  Widget _editField(TextEditingController controller, String label) {
+  Widget editField(TextEditingController controller, String label) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: TextField(
@@ -526,6 +585,7 @@ class _TablePageState extends State<TablePage> {
     setState(() {
       widget.rows.removeAt(index);
     });
+
     widget.onChanged();
   }
 
@@ -534,6 +594,8 @@ class _TablePageState extends State<TablePage> {
 
     final Map<String, List<DocumentRow>> groups = {};
 
+    // Прежнее правило:
+    // название + размеры + толщина + материал.
     for (final row in widget.rows) {
       final key = [
         row.product.toLowerCase().trim(),
@@ -563,6 +625,7 @@ class _TablePageState extends State<TablePage> {
       }
 
       final first = group.first.copy();
+
       final total = quantities.fold<int>(
         0,
         (sum, value) => sum + value!,
@@ -596,6 +659,7 @@ class _TablePageState extends State<TablePage> {
       widget.rows
         ..clear()
         ..addAll(previousRows!.map((row) => row.copy()));
+
       previousRows = null;
     });
 
@@ -613,23 +677,42 @@ class _TablePageState extends State<TablePage> {
           children: [
             Padding(
               padding: const EdgeInsets.all(8),
-              child: Wrap(
-                spacing: 8,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  FilledButton.tonal(
-                    onPressed: mergeDuplicates,
-                    child: const Text('Объединить одинаковые'),
+                  Text(
+                    'Позиций до объединения: ${widget.initialCount}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
                   ),
-                  OutlinedButton(
-                    onPressed: previousRows == null ? null : undoMerge,
-                    child: const Text('Отменить объединение'),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Позиций после объединения: ${widget.rows.length}',
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      FilledButton.tonal(
+                        onPressed: mergeDuplicates,
+                        child: const Text('Объединить одинаковые'),
+                      ),
+                      OutlinedButton(
+                        onPressed:
+                            previousRows == null ? null : undoMerge,
+                        child: const Text('Отменить объединение'),
+                      ),
+                    ],
                   ),
                 ],
               ),
             ),
             Expanded(
               child: widget.rows.isEmpty
-                  ? const Center(child: Text('Таблица пока пустая'))
+                  ? const Center(
+                      child: Text('Таблица пока пустая'),
+                    )
                   : ListView.builder(
                       itemCount: widget.rows.length,
                       itemBuilder: (context, index) {
