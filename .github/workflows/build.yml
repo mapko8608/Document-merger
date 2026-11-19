@@ -2,10 +2,10 @@
 name: Build Document Merger
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   android:
@@ -13,24 +13,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: subosito/flutter-action@v2
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
 
       - name: Create Flutter project
         run: flutter create --platforms=android,windows --project-name=document_merger .
-            - name: Set Android compileSdk
+
+      - name: Set Android compileSdk
         run: |
-          find android -name "build.gradle*" -type f -exec sed -i 's/compileSdk[[:space:]]*=[[:space:]]*flutter.compileSdkVersion/compileSdk = 36/g; s/compileSdkVersion[[:space:]]*34/compileSdkVersion 36/g' {} +
+          find android -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) -exec sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g; s/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 36/g' {} +
+
       - name: Install dependencies
         run: flutter pub get
 
       - name: Build APK
         run: flutter build apk --release
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
         with:
           name: document-merger-android
           path: build/app/outputs/flutter-apk/app-release.apk
@@ -40,9 +45,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: subosito/flutter-action@v2
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
 
@@ -55,10 +62,8 @@ jobs:
       - name: Build Windows
         run: flutter build windows --release
 
-      - name: Package Windows
-        run: Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath document-merger-windows.zip
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
         with:
           name: document-merger-windows
-          path: document-merger-windows.zip
+          path: build/windows/**/runner/Release/**
