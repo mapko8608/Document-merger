@@ -1,4 +1,6 @@
 
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:excel_plus/excel_plus.dart';
@@ -15,10 +17,7 @@ class DocumentMergerApp extends StatelessWidget {
     return MaterialApp(
       title: 'Document Merger',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        colorSchemeSeed: Colors.blue,
-        useMaterial3: true,
-      ),
+      theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true),
       home: const HomePage(),
     );
   }
@@ -28,8 +27,10 @@ class DocumentRow {
   String product;
   String dimensions;
   String quantity;
+  String unit;
   String thickness;
   String material;
+  String lengthMm;
   String source;
   String page;
   String originalText;
@@ -39,26 +40,52 @@ class DocumentRow {
     required this.product,
     required this.dimensions,
     required this.quantity,
+    required this.unit,
     required this.thickness,
     required this.material,
+    required this.lengthMm,
     required this.source,
     required this.page,
     required this.originalText,
     this.needsReview = false,
   });
 
-  DocumentRow copy() {
-    return DocumentRow(
-      product: product,
-      dimensions: dimensions,
-      quantity: quantity,
-      thickness: thickness,
-      material: material,
-      source: source,
-      page: page,
-      originalText: originalText,
-      needsReview: needsReview,
-    );
+  DocumentRow copy() => DocumentRow(
+    product: product,
+    dimensions: dimensions,
+    quantity: quantity,
+    unit: unit,
+    thickness: thickness,
+    material: material,
+    lengthMm: lengthMm,
+    source: source,
+    page: page,
+    originalText: originalText,
+    needsReview: needsReview,
+  );
+
+  bool get isStraightDuct {
+    final name = product.toLowerCase();
+    return name.contains('воздуховод') &&
+        !RegExp(
+          r'отвод|тройник|переход|клапан|заглушка|врезка|шумоглушитель|'
+          r'крышка|фланец|зонт|утка',
+        ).hasMatch(name);
+  }
+
+  String get calculatedPieces {
+    final meters = double.tryParse(quantity.replaceAll(',', '.'));
+    final length = double.tryParse(lengthMm.replaceAll(',', '.'));
+
+    if (!isStraightDuct ||
+        unit != 'м' ||
+        meters == null ||
+        length == null ||
+        length <= 0) {
+      return '';
+    }
+
+    return math.max(1, (meters * 1000 / length).ceil()).toString();
   }
 }
 
@@ -66,16 +93,20 @@ class ParsedRow {
   final String product;
   final String dimensions;
   final String quantity;
+  final String unit;
   final String thickness;
   final String material;
+  final String lengthMm;
   final bool needsReview;
 
   ParsedRow({
     required this.product,
     required this.dimensions,
     required this.quantity,
+    required this.unit,
     required this.thickness,
     required this.material,
+    required this.lengthMm,
     required this.needsReview,
   });
 }
@@ -90,7 +121,6 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final List<PlatformFile> documents = [];
   final List<DocumentRow> rows = [];
-
   bool isImporting = false;
 
   Future<void> addDocuments() async {
@@ -118,13 +148,8 @@ class _HomePageState extends State<HomePage> {
 
           for (final sheetName in workbook.tables.keys) {
             final sheet = workbook[sheetName];
-
             if (sheet != null) {
-              imported += importSheet(
-                sheet.rows,
-                file.name,
-                sheetName,
-              );
+              imported += importSheet(sheet.rows, file.name, sheetName);
             }
           }
         } catch (e) {
@@ -135,9 +160,7 @@ class _HomePageState extends State<HomePage> {
 
     if (!mounted) return;
 
-    setState(() {
-      isImporting = false;
-    });
+    setState(() => isImporting = false);
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -165,7 +188,6 @@ class _HomePageState extends State<HomePage> {
       if (cells.isEmpty) continue;
 
       final text = cells.join(' | ').trim();
-
       if (text.isEmpty || looksLikeHeader(text)) continue;
 
       final parsed = parseRow(text, cells);
@@ -181,8 +203,10 @@ class _HomePageState extends State<HomePage> {
           product: parsed.product,
           dimensions: parsed.dimensions,
           quantity: parsed.quantity,
+          unit: parsed.unit,
           thickness: parsed.thickness,
           material: parsed.material,
+          lengthMm: parsed.lengthMm,
           source: fileName,
           page: sheetName,
           originalText: text,
@@ -198,7 +222,6 @@ class _HomePageState extends State<HomePage> {
 
   bool looksLikeHeader(String text) {
     final value = text.toLowerCase();
-
     final words = [
       'наименование',
       'название',
@@ -211,7 +234,6 @@ class _HomePageState extends State<HomePage> {
     ];
 
     int matches = 0;
-
     for (final word in words) {
       if (value.contains(word)) matches++;
     }
@@ -219,22 +241,43 @@ class _HomePageState extends State<HomePage> {
     return matches >= 2;
   }
 
+  String normalizeUnit(String value) {
+    final v = value.toLowerCase().replaceAll('.', '').trim();
+
+    if (['м', 'метр', 'метры', 'метров', 'пм', 'погм',
+      'погонный метр', 'пог м'].contains(v)) {
+      return 'м';
+    }
+
+    if (['шт', 'штука', 'штуки', 'штук', 'pcs'].contains(v)) {
+      return 'шт';
+    }
+
+    if (['кг', 'килограмм', 'килограммы'].contains(v)) {
+      return 'кг';
+    }
+
+    if (['т', 'тонна', 'тонны'].contains(v)) return 'т';
+
+    return '';
+  }
+
   ParsedRow parseRow(String original, List<String> cells) {
-    final text = original.replaceAll('\n', ' ').trim();
-    String working = text;
+    String working = original.replaceAll('\n', ' ').trim();
 
     String dimensions = '';
     String thickness = '';
     String material = '';
     String quantity = '';
+    String unit = '';
+    String lengthMm = '';
 
     bool needsReview = false;
 
-    // Диаметры и размеры.
-    // Примеры: Ø250, ⌀250, D250, Ду250, 500x300.
+    // Размеры и диаметры.
     final dimensionRegex = RegExp(
       r'(?:Ø|⌀)\s*\d{2,4}(?:[.,]\d+)?'
-      r'|\b(?:ду|d)\s*[-=]?\s*\d{2,4}\b'
+      r'|(?:ду|d)\s*[-=]?\s*\d{2,4}'
       r'|\d{2,4}\s*[xх×*]\s*\d{2,4}'
       r'(?:\s*[xх×*]\s*\d{2,4})?',
       caseSensitive: false,
@@ -242,7 +285,7 @@ class _HomePageState extends State<HomePage> {
 
     final dimensionMatches = dimensionRegex
         .allMatches(working)
-        .map((match) => match.group(0)!.replaceAll(' ', ''))
+        .map((m) => m.group(0)!.replaceAll(' ', ''))
         .toSet()
         .toList();
 
@@ -251,52 +294,39 @@ class _HomePageState extends State<HomePage> {
       working = working.replaceAll(dimensionRegex, ' ');
     }
 
-    // Толщина с явным обозначением.
-    final markedThickness = RegExp(
-      r'(?:толщ(?:ина)?|(?<![а-яa-z])s|(?<![а-яa-z])t|δ)'
+    // Толщина: толщина стенки 0.7, толщина 0,7, b=0.7.
+    final thicknessRegex = RegExp(
+      r'(?:толщина(?:\s+стенки)?|стенка|'
+      r'(?<![a-zа-я])b)'
       r'\s*[:=]?\s*(\d{1,2}[.,]\d{1,3})',
       caseSensitive: false,
     );
 
-    final markedMatch = markedThickness.firstMatch(working);
+    final thicknessMatch = thicknessRegex.firstMatch(working);
 
-    if (markedMatch != null) {
-      thickness = markedMatch.group(1)!.replaceAll(',', '.');
-      working = working.replaceFirst(markedThickness, ' ');
+    if (thicknessMatch != null) {
+      thickness = thicknessMatch.group(1)!.replaceAll(',', '.');
+      working = working.replaceFirst(thicknessRegex, ' ');
     } else {
-      // Без обозначения принимаем только вероятную толщину.
       final decimalRegex = RegExp(
         r'(?<!\d)(\d{1,2}[.,]\d{1,3})(?!\d)',
       );
 
-      final decimalMatches = decimalRegex.allMatches(working).toList();
-
-      final possibleThicknesses = <RegExpMatch>[];
-
-      for (final match in decimalMatches) {
+      final possible = decimalRegex.allMatches(working).where((m) {
         final number = double.tryParse(
-          match.group(1)!.replaceAll(',', '.'),
+          m.group(1)!.replaceAll(',', '.'),
         );
+        return number != null && number >= 0.3 && number <= 3.0;
+      }).toList();
 
-        if (number != null && number >= 0.3 && number <= 3.0) {
-          possibleThicknesses.add(match);
-        }
-      }
-
-      if (possibleThicknesses.length == 1) {
-        final match = possibleThicknesses.first;
-        final number = double.parse(
-          match.group(1)!.replaceAll(',', '.'),
-        );
-
-        thickness = number.toStringAsFixed(2);
-
+      if (possible.length == 1) {
+        thickness = possible.first.group(1)!.replaceAll(',', '.');
         working = working.replaceRange(
-          match.start,
-          match.end,
+          possible.first.start,
+          possible.first.end,
           ' ',
         );
-      } else if (possibleThicknesses.length > 1) {
+      } else if (possible.length > 1) {
         needsReview = true;
       }
     }
@@ -315,7 +345,6 @@ class _HomePageState extends State<HomePage> {
 
     for (final pattern in materialPatterns) {
       final match = pattern.firstMatch(working);
-
       if (match != null) {
         material = match.group(0)!.trim();
         working = working.replaceFirst(pattern, ' ');
@@ -323,57 +352,103 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // Количество по явным обозначениям.
-    final quantityPatterns = [
-      RegExp(
-        r'(?:кол-?во|количество|qty)\s*[:=]?\s*(\d+)',
-        caseSensitive: false,
-      ),
-      RegExp(
-        r'(\d+)\s*(?:шт\.?|штук|pcs?)\b',
-        caseSensitive: false,
-      ),
-    ];
+    // Длина прямого воздуховода.
+    // Приоритет у явных обозначений: Длина 1500, L=1500, L=1.5 м.
+    final lengthRegex = RegExp(
+      r'(?:длина|дл\.?|(?<![a-zа-я])l)'
+      r'\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*(мм|mm|м|m)?',
+      caseSensitive: false,
+    );
 
-    for (final pattern in quantityPatterns) {
-      final match = pattern.firstMatch(working);
+    final lengthMatch = lengthRegex.firstMatch(working);
 
-      if (match != null) {
-        quantity = match.group(1)!;
-        working = working.replaceFirst(pattern, ' ');
-        break;
+    if (lengthMatch != null) {
+      final value = double.tryParse(
+        lengthMatch.group(1)!.replaceAll(',', '.'),
+      );
+
+      if (value != null && value > 0) {
+        final lengthUnit = (lengthMatch.group(2) ?? 'мм').toLowerCase();
+        lengthMm = (lengthUnit == 'м' || lengthUnit == 'm'
+                ? value * 1000
+                : value)
+            .toStringAsFixed(0);
+
+        working = working.replaceFirst(lengthRegex, ' ');
       }
     }
 
-    // Если количество записано отдельной ячейкой
-    // без слов "шт." или "количество".
+    // Количество вместе с единицей в одной ячейке или строке.
+    final quantityRegex = RegExp(
+      r'(\d+(?:[.,]\d+)?)\s*'
+      r'(погонных?\s*метр(?:а|ов)?|пог\.?\s*м|метр(?:а|ов)?|'
+      r'мм|mm|м|m|шт\.?|штук|pcs?|кг|т)\b',
+      caseSensitive: false,
+    );
+
+    final quantityMatch = quantityRegex.firstMatch(working);
+
+    if (quantityMatch != null) {
+      quantity = quantityMatch.group(1)!.replaceAll(',', '.');
+      unit = normalizeUnit(quantityMatch.group(2)!);
+      working = working.replaceFirst(quantityRegex, ' ');
+    }
+
+    // Количество в отдельной ячейке рядом с единицей измерения.
     if (quantity.isEmpty) {
-      final numericCells = <String>[];
+      for (int i = 0; i < cells.length; i++) {
+        final currentUnit = normalizeUnit(cells[i]);
 
-      for (final cell in cells) {
-        final value = cell.trim();
+        if (currentUnit.isEmpty) continue;
 
-        if (RegExp(r'^\d{1,5}$').hasMatch(value)) {
-          numericCells.add(value);
+        for (final index in [i - 1, i + 1]) {
+          if (index < 0 || index >= cells.length) continue;
+
+          final number = double.tryParse(
+            cells[index].replaceAll(',', '.'),
+          );
+
+          if (number != null && number > 0) {
+            quantity = number.toString();
+            unit = currentUnit;
+            break;
+          }
         }
+
+        if (quantity.isNotEmpty) break;
       }
+    }
+
+    // Явные обозначения количества.
+    if (quantity.isEmpty) {
+      final markedQuantity = RegExp(
+        r'(?:кол-?во|количество|qty)\s*[:=]?\s*(\d+(?:[.,]\d+)?)',
+        caseSensitive: false,
+      );
+
+      final match = markedQuantity.firstMatch(working);
+
+      if (match != null) {
+        quantity = match.group(1)!.replaceAll(',', '.');
+        working = working.replaceFirst(markedQuantity, ' ');
+      }
+    }
+
+    // Если единица измерения не найдена, но есть отдельная числовая ячейка,
+    // оставляем количество для проверки.
+    if (quantity.isEmpty) {
+      final numericCells = cells.where(
+        (c) => RegExp(r'^\d+(?:[.,]\d+)?$').hasMatch(c.trim()),
+      ).toList();
 
       if (numericCells.length == 1) {
-        quantity = numericCells.first;
-
-        // Удаляем найденное количество из текста,
-        // чтобы оно не попало в название изделия.
-        final escaped = RegExp.escape(quantity);
-        working = working.replaceFirst(
-          RegExp(r'(?<!\d)' + escaped + r'(?!\d)'),
-          ' ',
-        );
+        quantity = numericCells.first.replaceAll(',', '.');
+        needsReview = true;
       } else if (numericCells.length > 1) {
         needsReview = true;
       }
     }
 
-    // Очищаем название.
     String product = working
         .replaceAll('|', ' ')
         .replaceAll(RegExp(r'[,;]+'), ' ')
@@ -388,7 +463,6 @@ class _HomePageState extends State<HomePage> {
       '',
     );
 
-    // Не угадываем отсутствующие параметры.
     if (product.isEmpty ||
         dimensions.isEmpty ||
         quantity.isEmpty ||
@@ -397,8 +471,12 @@ class _HomePageState extends State<HomePage> {
       needsReview = true;
     }
 
+    if (quantity.isNotEmpty && unit.isEmpty) {
+      needsReview = true;
+    }
+
     if (product.isEmpty) {
-      product = text;
+      product = original;
       needsReview = true;
     }
 
@@ -406,8 +484,10 @@ class _HomePageState extends State<HomePage> {
       product: product,
       dimensions: dimensions,
       quantity: quantity,
+      unit: unit,
       thickness: thickness,
       material: material,
+      lengthMm: lengthMm,
       needsReview: needsReview,
     );
   }
@@ -428,9 +508,7 @@ class _HomePageState extends State<HomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Обработка документов'),
-      ),
+      appBar: AppBar(title: const Text('Обработка документов')),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -451,21 +529,15 @@ class _HomePageState extends State<HomePage> {
               const SizedBox(height: 16),
               if (isImporting) const LinearProgressIndicator(),
               const SizedBox(height: 8),
-              Text(
-                'Добавленные документы: ${documents.length}',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
+              Text('Добавленные документы: ${documents.length}'),
               const SizedBox(height: 8),
               Expanded(
                 child: documents.isEmpty
-                    ? const Center(
-                        child: Text('Документы пока не добавлены'),
-                      )
+                    ? const Center(child: Text('Документы пока не добавлены'))
                     : ListView.builder(
                         itemCount: documents.length,
                         itemBuilder: (context, index) {
                           final file = documents[index];
-
                           return Card(
                             child: ListTile(
                               leading: const Icon(Icons.insert_drive_file),
@@ -514,38 +586,40 @@ class _TablePageState extends State<TablePage> {
     final product = TextEditingController(text: row.product);
     final dimensions = TextEditingController(text: row.dimensions);
     final quantity = TextEditingController(text: row.quantity);
+    final unit = TextEditingController(text: row.unit);
     final thickness = TextEditingController(text: row.thickness);
     final material = TextEditingController(text: row.material);
+    final length = TextEditingController(text: row.lengthMm);
 
     final result = await showDialog<bool>(
       context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text('Редактирование позиции'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                editField(product, 'Название изделия'),
-                editField(dimensions, 'Размеры'),
-                editField(quantity, 'Количество'),
-                editField(thickness, 'Толщина'),
-                editField(material, 'Материал'),
-              ],
-            ),
+      builder: (context) => AlertDialog(
+        title: const Text('Редактирование позиции'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              editField(product, 'Название изделия'),
+              editField(dimensions, 'Размеры'),
+              editField(quantity, 'Количество'),
+              editField(unit, 'Единица измерения (м, шт, кг)'),
+              editField(thickness, 'Толщина'),
+              editField(material, 'Материал'),
+              editField(length, 'Длина одного изделия (мм)'),
+            ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Отмена'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Сохранить'),
-            ),
-          ],
-        );
-      },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
     );
 
     if (result == true) {
@@ -553,8 +627,10 @@ class _TablePageState extends State<TablePage> {
         row.product = product.text;
         row.dimensions = dimensions.text;
         row.quantity = quantity.text;
+        row.unit = unit.text.trim().toLowerCase();
         row.thickness = thickness.text;
         row.material = material.text;
+        row.lengthMm = length.text;
         row.needsReview = false;
       });
 
@@ -564,8 +640,10 @@ class _TablePageState extends State<TablePage> {
     product.dispose();
     dimensions.dispose();
     quantity.dispose();
+    unit.dispose();
     thickness.dispose();
     material.dispose();
+    length.dispose();
   }
 
   Widget editField(TextEditingController controller, String label) {
@@ -582,10 +660,7 @@ class _TablePageState extends State<TablePage> {
   }
 
   void deleteRow(int index) {
-    setState(() {
-      widget.rows.removeAt(index);
-    });
-
+    setState(() => widget.rows.removeAt(index));
     widget.onChanged();
   }
 
@@ -594,14 +669,13 @@ class _TablePageState extends State<TablePage> {
 
     final Map<String, List<DocumentRow>> groups = {};
 
-    // Прежнее правило:
-    // название + размеры + толщина + материал.
     for (final row in widget.rows) {
       final key = [
         row.product.toLowerCase().trim(),
         row.dimensions.toLowerCase().trim(),
         row.thickness.toLowerCase().trim(),
         row.material.toLowerCase().trim(),
+        row.unit.toLowerCase().trim(),
       ].join('|');
 
       groups.putIfAbsent(key, () => []).add(row);
@@ -616,7 +690,7 @@ class _TablePageState extends State<TablePage> {
       }
 
       final quantities = group
-          .map((row) => int.tryParse(row.quantity))
+          .map((row) => double.tryParse(row.quantity.replaceAll(',', '.')))
           .toList();
 
       if (quantities.any((value) => value == null)) {
@@ -625,8 +699,7 @@ class _TablePageState extends State<TablePage> {
       }
 
       final first = group.first.copy();
-
-      final total = quantities.fold<int>(
+      final total = quantities.fold<double>(
         0,
         (sum, value) => sum + value!,
       );
@@ -659,7 +732,6 @@ class _TablePageState extends State<TablePage> {
       widget.rows
         ..clear()
         ..addAll(previousRows!.map((row) => row.copy()));
-
       previousRows = null;
     });
 
@@ -699,8 +771,7 @@ class _TablePageState extends State<TablePage> {
                         child: const Text('Объединить одинаковые'),
                       ),
                       OutlinedButton(
-                        onPressed:
-                            previousRows == null ? null : undoMerge,
+                        onPressed: previousRows == null ? null : undoMerge,
                         child: const Text('Отменить объединение'),
                       ),
                     ],
@@ -710,13 +781,12 @@ class _TablePageState extends State<TablePage> {
             ),
             Expanded(
               child: widget.rows.isEmpty
-                  ? const Center(
-                      child: Text('Таблица пока пустая'),
-                    )
+                  ? const Center(child: Text('Таблица пока пустая'))
                   : ListView.builder(
                       itemCount: widget.rows.length,
                       itemBuilder: (context, index) {
                         final row = widget.rows[index];
+                        final pieces = row.calculatedPieces;
 
                         return Card(
                           margin: const EdgeInsets.symmetric(
@@ -737,7 +807,19 @@ class _TablePageState extends State<TablePage> {
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
                                 Text('Размеры: ${row.dimensions}'),
-                                Text('Количество: ${row.quantity}'),
+                                Text(
+                                  'Количество: ${row.quantity} '
+                                  '${row.unit}',
+                                ),
+                                if (pieces.isNotEmpty)
+                                  Text(
+                                    'Пересчёт: $pieces шт. '
+                                    '(длина ${row.lengthMm} мм)',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                Text('Длина: ${row.lengthMm} мм'),
                                 Text('Толщина: ${row.thickness}'),
                                 Text('Материал: ${row.material}'),
                                 Text('Источник: ${row.source}'),
