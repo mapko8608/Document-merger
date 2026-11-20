@@ -1,4 +1,3 @@
-
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -17,10 +16,23 @@ class DocumentMergerApp extends StatelessWidget {
     return MaterialApp(
       title: 'Document Merger',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(colorSchemeSeed: Colors.blue, useMaterial3: true),
+      theme: ThemeData(
+        colorSchemeSeed: Colors.blue,
+        useMaterial3: true,
+      ),
       home: const HomePage(),
     );
   }
+}
+
+class ImportedDocument {
+  final String id;
+  final PlatformFile file;
+
+  ImportedDocument({
+    required this.id,
+    required this.file,
+  });
 }
 
 class DocumentRow {
@@ -34,7 +46,15 @@ class DocumentRow {
   String source;
   String page;
   String originalText;
-  bool needsReview;
+
+  // ID всех исходных документов, из которых получена позиция.
+  Set<String> sourceIds;
+
+  // Конкретные причины, по которым позицию нужно проверить.
+  List<String> reviewReasons;
+
+  // Отличаем длину из заявки от длины, установленной по умолчанию.
+  bool lengthWasSpecified;
 
   DocumentRow({
     required this.product,
@@ -47,30 +67,52 @@ class DocumentRow {
     required this.source,
     required this.page,
     required this.originalText,
-    this.needsReview = false,
+    required this.sourceIds,
+    required this.reviewReasons,
+    this.lengthWasSpecified = false,
   });
 
   DocumentRow copy() => DocumentRow(
-    product: product,
-    dimensions: dimensions,
-    quantity: quantity,
-    unit: unit,
-    thickness: thickness,
-    material: material,
-    lengthMm: lengthMm,
-    source: source,
-    page: page,
-    originalText: originalText,
-    needsReview: needsReview,
-  );
+        product: product,
+        dimensions: dimensions,
+        quantity: quantity,
+        unit: unit,
+        thickness: thickness,
+        material: material,
+        lengthMm: lengthMm,
+        source: source,
+        page: page,
+        originalText: originalText,
+        sourceIds: Set<String>.from(sourceIds),
+        reviewReasons: List<String>.from(reviewReasons),
+        lengthWasSpecified: lengthWasSpecified,
+      );
+
+  bool get needsReview => reviewReasons.isNotEmpty;
 
   bool get isStraightDuct {
     final name = product.toLowerCase();
-    return name.contains('воздуховод') &&
-        !RegExp(
-          r'отвод|тройник|переход|клапан|заглушка|врезка|шумоглушитель|'
-          r'крышка|фланец|зонт|утка',
-        ).hasMatch(name);
+
+    final isDuctOrPipe =
+        name.contains('воздуховод') ||
+        name.contains('труба') ||
+        name.contains('трубопровод');
+
+    final isFitting = RegExp(
+      r'отвод|тройник|переход|клапан|заглушка|врезка|'
+      r'шумоглушитель|крышка|фланец|зонт|утка|'
+      r'вставка|дроссель',
+    ).hasMatch(name);
+
+    return isDuctOrPipe && !isFitting;
+  }
+
+  bool get isRound {
+    return RegExp(
+      r'ø|⌀|ду\s*[-=]?\s*\d|'
+      r'(?<![a-zа-я])d\s*[-=]?\s*\d',
+      caseSensitive: false,
+    ).hasMatch(dimensions);
   }
 
   String get calculatedPieces {
@@ -97,7 +139,8 @@ class ParsedRow {
   final String thickness;
   final String material;
   final String lengthMm;
-  final bool needsReview;
+  final bool lengthWasSpecified;
+  final List<String> reviewReasons;
 
   ParsedRow({
     required this.product,
@@ -107,7 +150,8 @@ class ParsedRow {
     required this.thickness,
     required this.material,
     required this.lengthMm,
-    required this.needsReview,
+    required this.lengthWasSpecified,
+    required this.reviewReasons,
   });
 }
 
@@ -119,9 +163,21 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final List<PlatformFile> documents = [];
+  final List<ImportedDocument> documents = [];
   final List<DocumentRow> rows = [];
+
   bool isImporting = false;
+
+  // Значения по умолчанию.
+  String roundLength = '3000';
+  String rectangularLength = '1500';
+
+  int documentCounter = 0;
+
+  String createDocumentId() {
+    documentCounter++;
+    return '${DateTime.now().microsecondsSinceEpoch}_$documentCounter';
+  }
 
   Future<void> addDocuments() async {
     final pickedFiles = await FilePicker.pickFiles(
@@ -131,14 +187,23 @@ class _HomePageState extends State<HomePage> {
 
     if (pickedFiles == null || pickedFiles.isEmpty) return;
 
+    final newDocuments = pickedFiles.map((file) {
+      return ImportedDocument(
+        id: createDocumentId(),
+        file: file,
+      );
+    }).toList();
+
     setState(() {
       isImporting = true;
-      documents.addAll(pickedFiles);
+      documents.addAll(newDocuments);
     });
 
     int imported = 0;
+    int failed = 0;
 
-    for (final file in pickedFiles) {
+    for (final document in newDocuments) {
+      final file = document.file;
       final extension = file.extension?.toLowerCase();
 
       if (extension == 'xlsx' || extension == 'xls') {
@@ -148,11 +213,18 @@ class _HomePageState extends State<HomePage> {
 
           for (final sheetName in workbook.tables.keys) {
             final sheet = workbook[sheetName];
+
             if (sheet != null) {
-              imported += importSheet(sheet.rows, file.name, sheetName);
+              imported += importSheet(
+                sheet.rows,
+                file.name,
+                sheetName,
+                document.id,
+              );
             }
           }
         } catch (e) {
+          failed++;
           debugPrint('Ошибка чтения ${file.name}: $e');
         }
       }
@@ -160,13 +232,16 @@ class _HomePageState extends State<HomePage> {
 
     if (!mounted) return;
 
-    setState(() => isImporting = false);
+    setState(() {
+      isImporting = false;
+    });
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(
-          'Добавлено документов: ${pickedFiles.length}. '
-          'Распознано строк Excel: $imported',
+          'Добавлено документов: ${newDocuments.length}. '
+          'Распознано строк Excel: $imported.'
+          '${failed > 0 ? ' Ошибок чтения: $failed.' : ''}',
         ),
       ),
     );
@@ -176,6 +251,7 @@ class _HomePageState extends State<HomePage> {
     List<List<Data?>> sheetRows,
     String fileName,
     String sheetName,
+    String documentId,
   ) {
     int imported = 0;
 
@@ -188,6 +264,7 @@ class _HomePageState extends State<HomePage> {
       if (cells.isEmpty) continue;
 
       final text = cells.join(' | ').trim();
+
       if (text.isEmpty || looksLikeHeader(text)) continue;
 
       final parsed = parseRow(text, cells);
@@ -198,6 +275,28 @@ class _HomePageState extends State<HomePage> {
         continue;
       }
 
+      String length = parsed.lengthMm;
+
+      final name = parsed.product.toLowerCase();
+      final isStraight = (name.contains('воздуховод') ||
+              name.contains('труба') ||
+              name.contains('трубопровод')) &&
+          !RegExp(
+            r'отвод|тройник|переход|клапан|заглушка|врезка|'
+            r'шумоглушитель|крышка|фланец|зонт|утка|'
+            r'вставка|дроссель',
+          ).hasMatch(name);
+
+      if (length.isEmpty && isStraight) {
+        final round = RegExp(
+          r'ø|⌀|ду\s*[-=]?\s*\d|'
+          r'(?<![a-zа-я])d\s*[-=]?\s*\d',
+          caseSensitive: false,
+        ).hasMatch(parsed.dimensions);
+
+        length = round ? roundLength : rectangularLength;
+      }
+
       rows.add(
         DocumentRow(
           product: parsed.product,
@@ -206,11 +305,13 @@ class _HomePageState extends State<HomePage> {
           unit: parsed.unit,
           thickness: parsed.thickness,
           material: parsed.material,
-          lengthMm: parsed.lengthMm,
+          lengthMm: length,
           source: fileName,
           page: sheetName,
           originalText: text,
-          needsReview: parsed.needsReview,
+          sourceIds: {documentId},
+          reviewReasons: List<String>.from(parsed.reviewReasons),
+          lengthWasSpecified: parsed.lengthWasSpecified,
         ),
       );
 
@@ -222,6 +323,7 @@ class _HomePageState extends State<HomePage> {
 
   bool looksLikeHeader(String text) {
     final value = text.toLowerCase();
+
     final words = [
       'наименование',
       'название',
@@ -234,6 +336,7 @@ class _HomePageState extends State<HomePage> {
     ];
 
     int matches = 0;
+
     for (final word in words) {
       if (value.contains(word)) matches++;
     }
@@ -244,16 +347,35 @@ class _HomePageState extends State<HomePage> {
   String normalizeUnit(String value) {
     final v = value.toLowerCase().replaceAll('.', '').trim();
 
-    if (['м', 'метр', 'метры', 'метров', 'пм', 'погм',
-      'погонный метр', 'пог м'].contains(v)) {
+    if ([
+      'м',
+      'метр',
+      'метры',
+      'метров',
+      'пм',
+      'погм',
+      'погонный метр',
+      'пог м',
+    ].contains(v)) {
       return 'м';
     }
 
-    if (['шт', 'штука', 'штуки', 'штук', 'pcs'].contains(v)) {
+    if ([
+      'шт',
+      'штука',
+      'штуки',
+      'штук',
+      'pcs',
+      'pc',
+    ].contains(v)) {
       return 'шт';
     }
 
-    if (['кг', 'килограмм', 'килограммы'].contains(v)) {
+    if ([
+      'кг',
+      'килограмм',
+      'килограммы',
+    ].contains(v)) {
       return 'кг';
     }
 
@@ -272,7 +394,9 @@ class _HomePageState extends State<HomePage> {
     String unit = '';
     String lengthMm = '';
 
-    bool needsReview = false;
+    bool lengthWasSpecified = false;
+
+    final reasons = <String>[];
 
     // Размеры и диаметры.
     final dimensionRegex = RegExp(
@@ -292,9 +416,11 @@ class _HomePageState extends State<HomePage> {
     if (dimensionMatches.isNotEmpty) {
       dimensions = dimensionMatches.join('; ');
       working = working.replaceAll(dimensionRegex, ' ');
+    } else {
+      reasons.add('Не распознаны размеры изделия');
     }
 
-    // Толщина: толщина стенки 0.7, толщина 0,7, b=0.7.
+    // Толщина.
     final thicknessRegex = RegExp(
       r'(?:толщина(?:\s+стенки)?|стенка|'
       r'(?<![a-zа-я])b)'
@@ -316,18 +442,22 @@ class _HomePageState extends State<HomePage> {
         final number = double.tryParse(
           m.group(1)!.replaceAll(',', '.'),
         );
+
         return number != null && number >= 0.3 && number <= 3.0;
       }).toList();
 
       if (possible.length == 1) {
         thickness = possible.first.group(1)!.replaceAll(',', '.');
+
         working = working.replaceRange(
           possible.first.start,
           possible.first.end,
           ' ',
         );
       } else if (possible.length > 1) {
-        needsReview = true;
+        reasons.add('Найдено несколько возможных значений толщины');
+      } else {
+        reasons.add('Не распознана толщина');
       }
     }
 
@@ -345,6 +475,7 @@ class _HomePageState extends State<HomePage> {
 
     for (final pattern in materialPatterns) {
       final match = pattern.firstMatch(working);
+
       if (match != null) {
         material = match.group(0)!.trim();
         working = working.replaceFirst(pattern, ' ');
@@ -352,8 +483,11 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // Длина прямого воздуховода.
-    // Приоритет у явных обозначений: Длина 1500, L=1500, L=1.5 м.
+    if (material.isEmpty) {
+      reasons.add('Не распознан материал');
+    }
+
+    // Явно указанная длина.
     final lengthRegex = RegExp(
       r'(?:длина|дл\.?|(?<![a-zа-я])l)'
       r'\s*[:=]?\s*(\d+(?:[.,]\d+)?)\s*(мм|mm|м|m)?',
@@ -368,21 +502,27 @@ class _HomePageState extends State<HomePage> {
       );
 
       if (value != null && value > 0) {
-        final lengthUnit = (lengthMatch.group(2) ?? 'мм').toLowerCase();
+        final lengthUnit =
+            (lengthMatch.group(2) ?? 'мм').toLowerCase();
+
         lengthMm = (lengthUnit == 'м' || lengthUnit == 'm'
                 ? value * 1000
                 : value)
             .toStringAsFixed(0);
 
+        lengthWasSpecified = true;
         working = working.replaceFirst(lengthRegex, ' ');
       }
     }
 
-    // Количество вместе с единицей в одной ячейке или строке.
+    // Количество с единицей измерения.
+    // Используется отрицательная проверка вместо \b,
+    // чтобы корректно обрабатывать русские обозначения.
     final quantityRegex = RegExp(
       r'(\d+(?:[.,]\d+)?)\s*'
-      r'(погонных?\s*метр(?:а|ов)?|пог\.?\s*м|метр(?:а|ов)?|'
-      r'мм|mm|м|m|шт\.?|штук|pcs?|кг|т)\b',
+      r'(погонных?\s*метр(?:а|ов)?|пог\.?\s*м|'
+      r'метр(?:а|ов)?|мм|mm|м|m|шт\.?|штук|pcs?|кг|т)'
+      r'(?![а-яa-z])',
       caseSensitive: false,
     );
 
@@ -394,7 +534,7 @@ class _HomePageState extends State<HomePage> {
       working = working.replaceFirst(quantityRegex, ' ');
     }
 
-    // Количество в отдельной ячейке рядом с единицей измерения.
+    // Количество и единица в соседних ячейках.
     if (quantity.isEmpty) {
       for (int i = 0; i < cells.length; i++) {
         final currentUnit = normalizeUnit(cells[i]);
@@ -419,7 +559,7 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // Явные обозначения количества.
+    // Явное поле количества.
     if (quantity.isEmpty) {
       final markedQuantity = RegExp(
         r'(?:кол-?во|количество|qty)\s*[:=]?\s*(\d+(?:[.,]\d+)?)',
@@ -434,8 +574,7 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // Если единица измерения не найдена, но есть отдельная числовая ячейка,
-    // оставляем количество для проверки.
+    // Числовая ячейка без единицы измерения.
     if (quantity.isEmpty) {
       final numericCells = cells.where(
         (c) => RegExp(r'^\d+(?:[.,]\d+)?$').hasMatch(c.trim()),
@@ -443,12 +582,22 @@ class _HomePageState extends State<HomePage> {
 
       if (numericCells.length == 1) {
         quantity = numericCells.first.replaceAll(',', '.');
-        needsReview = true;
+        reasons.add('Количество найдено, но единица измерения не определена');
       } else if (numericCells.length > 1) {
-        needsReview = true;
+        reasons.add('Найдено несколько возможных значений количества');
+      } else {
+        reasons.add('Не распознано количество');
       }
     }
 
+    if (quantity.isNotEmpty && unit.isEmpty &&
+        !reasons.contains(
+          'Количество найдено, но единица измерения не определена',
+        )) {
+      reasons.add('Не определена единица измерения количества');
+    }
+
+    // Название изделия.
     String product = working
         .replaceAll('|', ' ')
         .replaceAll(RegExp(r'[,;]+'), ' ')
@@ -463,21 +612,9 @@ class _HomePageState extends State<HomePage> {
       '',
     );
 
-    if (product.isEmpty ||
-        dimensions.isEmpty ||
-        quantity.isEmpty ||
-        thickness.isEmpty ||
-        material.isEmpty) {
-      needsReview = true;
-    }
-
-    if (quantity.isNotEmpty && unit.isEmpty) {
-      needsReview = true;
-    }
-
     if (product.isEmpty) {
       product = original;
-      needsReview = true;
+      reasons.add('Не распознано название изделия');
     }
 
     return ParsedRow(
@@ -488,7 +625,71 @@ class _HomePageState extends State<HomePage> {
       thickness: thickness,
       material: material,
       lengthMm: lengthMm,
-      needsReview: needsReview,
+      lengthWasSpecified: lengthWasSpecified,
+      reviewReasons: reasons,
+    );
+  }  void updateDefaultLengths({
+    String? newRoundLength,
+    String? newRectangularLength,
+  }) {
+    setState(() {
+      if (newRoundLength != null) {
+        roundLength = newRoundLength;
+      }
+
+      if (newRectangularLength != null) {
+        rectangularLength = newRectangularLength;
+      }
+
+      // Обновляем длину уже загруженных прямых воздуховодов и труб,
+      // если длина не была явно указана в заявке.
+      for (final row in rows) {
+        if (!row.isStraightDuct || row.lengthWasSpecified) continue;
+
+        row.lengthMm = row.isRound
+            ? roundLength
+            : rectangularLength;
+      }
+    });
+  }
+
+  Future<void> deleteDocument(ImportedDocument document) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Удалить документ?'),
+        content: Text(
+          'Документ «${document.file.name}» будет удалён из списка. '
+          'Все позиции, полученные из него, также будут удалены. '
+          'Позиции из других документов останутся.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      documents.removeWhere((item) => item.id == document.id);
+
+      rows.removeWhere(
+        (row) => row.sourceIds.contains(document.id),
+      );
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Документ и его позиции удалены'),
+      ),
     );
   }
 
@@ -505,10 +706,40 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget lengthSelector({
+    required String title,
+    required String selected,
+    required List<String> options,
+    required ValueChanged<String> onSelected,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 8,
+          children: options.map((value) {
+            return ChoiceChip(
+              label: Text('$value мм'),
+              selected: selected == value,
+              onSelected: (_) => onSelected(value),
+            );
+          }).toList(),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Обработка документов')),
+      appBar: AppBar(
+        title: const Text('Обработка документов'),
+      ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(16),
@@ -524,26 +755,84 @@ class _HomePageState extends State<HomePage> {
               FilledButton.tonalIcon(
                 onPressed: openTable,
                 icon: const Icon(Icons.table_chart),
-                label: Text('Открыть общую таблицу (${rows.length})'),
+                label: Text(
+                  'Открыть общую таблицу (${rows.length})',
+                ),
               ),
               const SizedBox(height: 16),
-              if (isImporting) const LinearProgressIndicator(),
+              const Divider(),
+              const Text(
+                'Длина по умолчанию для прямых воздуховодов и труб',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 12),
+              lengthSelector(
+                title: 'Круглые',
+                selected: roundLength,
+                options: const ['3000', '1250'],
+                onSelected: (value) {
+                  updateDefaultLengths(newRoundLength: value);
+                },
+              ),
+              const SizedBox(height: 12),
+              lengthSelector(
+                title: 'Прямоугольные',
+                selected: rectangularLength,
+                options: const ['1250', '1500'],
+                onSelected: (value) {
+                  updateDefaultLengths(newRectangularLength: value);
+                },
+              ),
               const SizedBox(height: 8),
+              const Text(
+                'Если длина указана в заявке, используется она. '
+                'Выбранная длина применяется только при отсутствии '
+                'явного значения.',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey,
+                ),
+              ),
+              const Divider(height: 24),
+              if (isImporting) ...[
+                const LinearProgressIndicator(),
+                const SizedBox(height: 8),
+              ],
               Text('Добавленные документы: ${documents.length}'),
               const SizedBox(height: 8),
               Expanded(
                 child: documents.isEmpty
-                    ? const Center(child: Text('Документы пока не добавлены'))
+                    ? const Center(
+                        child: Text('Документы пока не добавлены'),
+                      )
                     : ListView.builder(
                         itemCount: documents.length,
                         itemBuilder: (context, index) {
-                          final file = documents[index];
+                          final document = documents[index];
+                          final file = document.file;
+
+                          final count = rows.where(
+                            (row) => row.sourceIds.contains(document.id),
+                          ).length;
+
                           return Card(
                             child: ListTile(
-                              leading: const Icon(Icons.insert_drive_file),
+                              leading: const Icon(
+                                Icons.insert_drive_file,
+                              ),
                               title: Text(file.name),
                               subtitle: Text(
-                                file.extension?.toUpperCase() ?? 'Файл',
+                                '${file.extension?.toUpperCase() ?? 'Файл'}'
+                                ' • Позиций: $count',
+                              ),
+                              trailing: IconButton(
+                                tooltip: 'Удалить документ',
+                                icon: const Icon(
+                                  Icons.delete_outline,
+                                ),
+                                onPressed: isImporting
+                                    ? null
+                                    : () => deleteDocument(document),
                               ),
                             ),
                           );
@@ -551,9 +840,12 @@ class _HomePageState extends State<HomePage> {
                       ),
               ),
               const Text(
-                'PDF пока добавляется в список, '
-                'но распознавание содержимого PDF ещё не подключено.',
-                style: TextStyle(fontSize: 12, color: Colors.grey),
+                'PDF пока добавляется в список, но распознавание '
+                'содержимого PDF ещё не подключено.',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey,
+                ),
               ),
             ],
           ),
@@ -593,7 +885,7 @@ class _TablePageState extends State<TablePage> {
 
     final result = await showDialog<bool>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Редактирование позиции'),
         content: SingleChildScrollView(
           child: Column(
@@ -611,27 +903,32 @@ class _TablePageState extends State<TablePage> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, false),
+            onPressed: () => Navigator.pop(dialogContext, false),
             child: const Text('Отмена'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(context, true),
+            onPressed: () => Navigator.pop(dialogContext, true),
             child: const Text('Сохранить'),
           ),
         ],
       ),
     );
 
-    if (result == true) {
+    if (result == true && mounted) {
       setState(() {
-        row.product = product.text;
-        row.dimensions = dimensions.text;
-        row.quantity = quantity.text;
+        row.product = product.text.trim();
+        row.dimensions = dimensions.text.trim();
+        row.quantity = quantity.text.trim();
         row.unit = unit.text.trim().toLowerCase();
-        row.thickness = thickness.text;
-        row.material = material.text;
-        row.lengthMm = length.text;
-        row.needsReview = false;
+        row.thickness = thickness.text.trim();
+        row.material = material.text.trim();
+        row.lengthMm = length.text.trim();
+
+        // Ручное изменение длины считаем явным значением.
+        row.lengthWasSpecified = row.lengthMm.isNotEmpty;
+
+        // После ручного исправления снимаем предупреждения.
+        row.reviewReasons.clear();
       });
 
       widget.onChanged();
@@ -646,7 +943,10 @@ class _TablePageState extends State<TablePage> {
     length.dispose();
   }
 
-  Widget editField(TextEditingController controller, String label) {
+  Widget editField(
+    TextEditingController controller,
+    String label,
+  ) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: TextField(
@@ -660,11 +960,13 @@ class _TablePageState extends State<TablePage> {
   }
 
   void deleteRow(int index) {
-    setState(() => widget.rows.removeAt(index));
-    widget.onChanged();
-  }
+    setState(() {
+      widget.rows.removeAt(index);
+      previousRows = null;
+    });
 
-  void mergeDuplicates() {
+    widget.onChanged();
+  }  void mergeDuplicates() {
     previousRows = widget.rows.map((row) => row.copy()).toList();
 
     final Map<String, List<DocumentRow>> groups = {};
@@ -690,7 +992,11 @@ class _TablePageState extends State<TablePage> {
       }
 
       final quantities = group
-          .map((row) => double.tryParse(row.quantity.replaceAll(',', '.')))
+          .map(
+            (row) => double.tryParse(
+              row.quantity.replaceAll(',', '.'),
+            ),
+          )
           .toList();
 
       if (quantities.any((value) => value == null)) {
@@ -699,15 +1005,39 @@ class _TablePageState extends State<TablePage> {
       }
 
       final first = group.first.copy();
+
       final total = quantities.fold<double>(
         0,
         (sum, value) => sum + value!,
       );
 
       first.quantity = total.toString();
-      first.source = group.map((r) => r.source).toSet().join('; ');
-      first.page = group.map((r) => r.page).toSet().join('; ');
-      first.needsReview = group.any((r) => r.needsReview);
+
+      first.source = group
+          .map((row) => row.source)
+          .where((value) => value.isNotEmpty)
+          .toSet()
+          .join('; ');
+
+      first.page = group
+          .map((row) => row.page)
+          .where((value) => value.isNotEmpty)
+          .toSet()
+          .join('; ');
+
+      first.originalText = group
+          .map((row) => row.originalText)
+          .where((value) => value.isNotEmpty)
+          .join('\n---\n');
+
+      first.sourceIds = group
+          .expand((row) => row.sourceIds)
+          .toSet();
+
+      first.reviewReasons = group
+          .expand((row) => row.reviewReasons)
+          .toSet()
+          .toList();
 
       merged.add(first);
     }
@@ -721,7 +1051,9 @@ class _TablePageState extends State<TablePage> {
     widget.onChanged();
 
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Объединение выполнено')),
+      const SnackBar(
+        content: Text('Объединение выполнено'),
+      ),
     );
   }
 
@@ -731,11 +1063,66 @@ class _TablePageState extends State<TablePage> {
     setState(() {
       widget.rows
         ..clear()
-        ..addAll(previousRows!.map((row) => row.copy()));
+        ..addAll(
+          previousRows!.map((row) => row.copy()),
+        );
+
       previousRows = null;
     });
 
     widget.onChanged();
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Объединение отменено'),
+      ),
+    );
+  }
+
+  Widget buildReviewInfo(DocumentRow row) {
+    if (!row.needsReview) {
+      return const Text(
+        'Проверка не требуется',
+        style: TextStyle(
+          color: Colors.green,
+          fontWeight: FontWeight.w600,
+        ),
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(top: 6),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.orange.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Требуется проверка:',
+            style: TextStyle(
+              color: Colors.orange,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          const SizedBox(height: 4),
+          ...row.reviewReasons.map(
+            (reason) => Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '• $reason',
+                style: const TextStyle(
+                  color: Colors.deepOrange,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -754,12 +1141,16 @@ class _TablePageState extends State<TablePage> {
                 children: [
                   Text(
                     'Позиций до объединения: ${widget.initialCount}',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Позиций после объединения: ${widget.rows.length}',
-                    style: const TextStyle(fontWeight: FontWeight.bold),
+                    'Позиций сейчас: ${widget.rows.length}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   Wrap(
@@ -767,11 +1158,15 @@ class _TablePageState extends State<TablePage> {
                     runSpacing: 8,
                     children: [
                       FilledButton.tonal(
-                        onPressed: mergeDuplicates,
+                        onPressed: widget.rows.isEmpty
+                            ? null
+                            : mergeDuplicates,
                         child: const Text('Объединить одинаковые'),
                       ),
                       OutlinedButton(
-                        onPressed: previousRows == null ? null : undoMerge,
+                        onPressed: previousRows == null
+                            ? null
+                            : undoMerge,
                         child: const Text('Отменить объединение'),
                       ),
                     ],
@@ -781,7 +1176,9 @@ class _TablePageState extends State<TablePage> {
             ),
             Expanded(
               child: widget.rows.isEmpty
-                  ? const Center(child: Text('Таблица пока пустая'))
+                  ? const Center(
+                      child: Text('Таблица пока пустая'),
+                    )
                   : ListView.builder(
                       itemCount: widget.rows.length,
                       itemBuilder: (context, index) {
@@ -804,7 +1201,8 @@ class _TablePageState extends State<TablePage> {
                             ),
                             title: Text(row.product),
                             subtitle: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                              crossAxisAlignment:
+                                  CrossAxisAlignment.start,
                               children: [
                                 Text('Размеры: ${row.dimensions}'),
                                 Text(
@@ -824,20 +1222,24 @@ class _TablePageState extends State<TablePage> {
                                 Text('Материал: ${row.material}'),
                                 Text('Источник: ${row.source}'),
                                 Text('Лист: ${row.page}'),
-                                if (row.needsReview)
-                                  const Text(
-                                    'Проверить',
-                                    style: TextStyle(
-                                      color: Colors.orange,
-                                      fontWeight: FontWeight.bold,
-                                    ),
+                                buildReviewInfo(row),
+                                const SizedBox(height: 4),
+                                const Text(
+                                  'Нажмите на позицию, чтобы изменить её',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: Colors.grey,
                                   ),
+                                ),
                               ],
                             ),
                             isThreeLine: true,
                             onTap: () => editRow(row),
                             trailing: IconButton(
-                              icon: const Icon(Icons.delete_outline),
+                              tooltip: 'Удалить позицию',
+                              icon: const Icon(
+                                Icons.delete_outline,
+                              ),
                               onPressed: () => deleteRow(index),
                             ),
                           ),
